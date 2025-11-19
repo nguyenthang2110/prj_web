@@ -1,0 +1,618 @@
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const WebSocket = require('ws');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: false
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// ==================== AUTHENTICATION ====================
+
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password, fullName } = req.body;
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const result = await pool.query(
+      'INSERT INTO users (username, email, password_hash, full_name) VALUES ($1, $2, $3, $4) RETURNING id, username, email, full_name, role',
+      [username, email, hashedPassword, fullName]
+    );
+    
+    res.status(201).json({ user: result.rows[0] });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(400).json({ error: 'User already exists or invalid data' });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    const result = await pool.query(
+      'SELECT * FROM users WHERE username = $1',
+      [username]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    // Save session
+    await pool.query(
+      'INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'24 hours\')',
+      [user.id, token]
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        fullName: user.full_name,
+        role: user.role
+      }
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Logout
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    const token = req.headers['authorization'].split(' ')[1];
+    await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+    res.json({ message: 'Logged out successfully' });
+  } catch (err) {
+    res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, username, email, full_name, role FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get user info' });
+  }
+});
+
+// ==================== DASHBOARDS ====================
+
+// Get all dashboards
+app.get('/api/dashboards', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT d.*, u.username as created_by_username FROM dashboards d LEFT JOIN users u ON d.created_by = u.id ORDER BY d.updated_at DESC'
+    );
+    res.json({ dashboards: result.rows });
+  } catch (err) {
+    console.error('Error fetching dashboards:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboards' });
+  }
+});
+
+// Get single dashboard
+app.get('/api/dashboards/:uid', authenticateToken, async (req, res) => {
+  try {
+    const dashResult = await pool.query(
+      'SELECT * FROM dashboards WHERE uid = $1',
+      [req.params.uid]
+    );
+    
+    if (dashResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Dashboard not found' });
+    }
+    
+    const dashboard = dashResult.rows[0];
+    
+    // Get panels
+    const panelsResult = await pool.query(
+      'SELECT * FROM panels WHERE dashboard_id = $1',
+      [dashboard.id]
+    );
+    
+    // Get variables
+    const varsResult = await pool.query(
+      'SELECT * FROM variables WHERE dashboard_id = $1',
+      [dashboard.id]
+    );
+    
+    res.json({
+      ...dashboard,
+      panels: panelsResult.rows,
+      variables: varsResult.rows
+    });
+  } catch (err) {
+    console.error('Error fetching dashboard:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboard' });
+  }
+});
+
+// Create dashboard
+app.post('/api/dashboards', authenticateToken, async (req, res) => {
+  try {
+    const { title, description, tags, data } = req.body;
+    const uid = generateUID();
+    
+    const result = await pool.query(
+      'INSERT INTO dashboards (uid, title, description, tags, created_by, data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [uid, title, description, tags, req.user.id, data]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating dashboard:', err);
+    res.status(500).json({ error: 'Failed to create dashboard' });
+  }
+});
+
+// Update dashboard
+app.put('/api/dashboards/:uid', authenticateToken, async (req, res) => {
+  try {
+    const { title, description, tags, data } = req.body;
+    
+    const result = await pool.query(
+      'UPDATE dashboards SET title = $1, description = $2, tags = $3, data = $4, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE uid = $5 RETURNING *',
+      [title, description, tags, data, req.params.uid]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Dashboard not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating dashboard:', err);
+    res.status(500).json({ error: 'Failed to update dashboard' });
+  }
+});
+
+// Delete dashboard
+app.delete('/api/dashboards/:uid', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM dashboards WHERE uid = $1 RETURNING id',
+      [req.params.uid]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Dashboard not found' });
+    }
+    
+    res.json({ message: 'Dashboard deleted' });
+  } catch (err) {
+    console.error('Error deleting dashboard:', err);
+    res.status(500).json({ error: 'Failed to delete dashboard' });
+  }
+});
+
+// Export dashboard
+app.get('/api/dashboards/:uid/export', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM dashboards WHERE uid = $1',
+      [req.params.uid]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Dashboard not found' });
+    }
+    
+    const dashboard = result.rows[0];
+    
+    // Get panels and variables
+    const panels = await pool.query('SELECT * FROM panels WHERE dashboard_id = $1', [dashboard.id]);
+    const variables = await pool.query('SELECT * FROM variables WHERE dashboard_id = $1', [dashboard.id]);
+    
+    const exportData = {
+      dashboard: {
+        ...dashboard,
+        panels: panels.rows,
+        variables: variables.rows
+      },
+      meta: {
+        exportedBy: req.user.username,
+        exportedAt: new Date(),
+        version: '1.0'
+      }
+    };
+    
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${dashboard.uid}.json"`);
+    res.json(exportData);
+  } catch (err) {
+    console.error('Export error:', err);
+    res.status(500).json({ error: 'Export failed' });
+  }
+});
+
+// Import dashboard
+app.post('/api/dashboards/import', authenticateToken, async (req, res) => {
+  try {
+    const { dashboard } = req.body;
+    const newUid = generateUID();
+    
+    // Insert dashboard
+    const dashResult = await pool.query(
+      'INSERT INTO dashboards (uid, title, description, tags, created_by, data) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [newUid, dashboard.title, dashboard.description, dashboard.tags, req.user.id, dashboard.data]
+    );
+    
+    const newDashboard = dashResult.rows[0];
+    
+    // Insert panels
+    if (dashboard.panels) {
+      for (const panel of dashboard.panels) {
+        await pool.query(
+          'INSERT INTO panels (dashboard_id, title, type, position, datasource, targets, options) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [newDashboard.id, panel.title, panel.type, panel.position, panel.datasource, panel.targets, panel.options]
+        );
+      }
+    }
+    
+    // Insert variables
+    if (dashboard.variables) {
+      for (const variable of dashboard.variables) {
+        await pool.query(
+          'INSERT INTO variables (dashboard_id, name, type, query, datasource, options) VALUES ($1, $2, $3, $4, $5, $6)',
+          [newDashboard.id, variable.name, variable.type, variable.query, variable.datasource, variable.options]
+        );
+      }
+    }
+    
+    res.status(201).json(newDashboard);
+  } catch (err) {
+    console.error('Import error:', err);
+    res.status(500).json({ error: 'Import failed' });
+  }
+});
+
+// ==================== PANELS ====================
+
+app.get('/api/dashboards/:id/panels', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM panels WHERE dashboard_id = $1',
+      [req.params.id]
+    );
+    res.json({ panels: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch panels' });
+  }
+});
+
+app.post('/api/dashboards/:id/panels', authenticateToken, async (req, res) => {
+  try {
+    const { title, type, position, datasource, targets, options } = req.body;
+    
+    const result = await pool.query(
+      'INSERT INTO panels (dashboard_id, title, type, position, datasource, targets, options) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.params.id, title, type, position, datasource, targets, options]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create panel' });
+  }
+});
+
+app.put('/api/panels/:id', authenticateToken, async (req, res) => {
+  try {
+    const { title, type, position, datasource, targets, options } = req.body;
+    
+    const result = await pool.query(
+      'UPDATE panels SET title = $1, type = $2, position = $3, datasource = $4, targets = $5, options = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $7 RETURNING *',
+      [title, type, position, datasource, targets, options, req.params.id]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update panel' });
+  }
+});
+
+app.delete('/api/panels/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM panels WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Panel deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete panel' });
+  }
+});
+
+// ==================== VARIABLES ====================
+
+app.get('/api/dashboards/:id/variables', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM variables WHERE dashboard_id = $1',
+      [req.params.id]
+    );
+    res.json({ variables: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch variables' });
+  }
+});
+
+app.post('/api/dashboards/:id/variables', authenticateToken, async (req, res) => {
+  try {
+    const { name, type, query, datasource, options, multi, includeAll } = req.body;
+    
+    const result = await pool.query(
+      'INSERT INTO variables (dashboard_id, name, type, query, datasource, options, multi, include_all) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.params.id, name, type, query, datasource, options, multi, includeAll]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create variable' });
+  }
+});
+
+// ==================== ALERTS ====================
+
+app.get('/api/alerts', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT a.*, d.title as dashboard_title, p.title as panel_title FROM alerts a JOIN dashboards d ON a.dashboard_id = d.id JOIN panels p ON a.panel_id = p.id ORDER BY a.updated_at DESC'
+    );
+    res.json({ alerts: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch alerts' });
+  }
+});
+
+app.post('/api/alerts', authenticateToken, async (req, res) => {
+  try {
+    const { dashboardId, panelId, name, message, frequency, conditions, notifications } = req.body;
+    
+    const result = await pool.query(
+      'INSERT INTO alerts (dashboard_id, panel_id, name, message, frequency, conditions, notifications) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [dashboardId, panelId, name, message, frequency, conditions, notifications]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create alert' });
+  }
+});
+
+app.put('/api/alerts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, message, state, frequency, conditions, notifications } = req.body;
+    
+    const result = await pool.query(
+      'UPDATE alerts SET name = $1, message = $2, state = $3, frequency = $4, conditions = $5, notifications = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $7 RETURNING *',
+      [name, message, state, frequency, conditions, notifications, req.params.id]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update alert' });
+  }
+});
+
+app.delete('/api/alerts/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM alerts WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Alert deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete alert' });
+  }
+});
+
+// Get alert history
+app.get('/api/alerts/:id/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM alert_history WHERE alert_id = $1 ORDER BY triggered_at DESC LIMIT 100',
+      [req.params.id]
+    );
+    res.json({ history: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch alert history' });
+  }
+});
+
+// ==================== TEMPLATES ====================
+
+app.get('/api/templates', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT t.*, u.username as created_by_username FROM templates t LEFT JOIN users u ON t.created_by = u.id ORDER BY t.downloads DESC'
+    );
+    res.json({ templates: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch templates' });
+  }
+});
+
+app.post('/api/templates', authenticateToken, async (req, res) => {
+  try {
+    const { name, description, category, tags, dashboardData } = req.body;
+    const uid = generateUID();
+    
+    const result = await pool.query(
+      'INSERT INTO templates (uid, name, description, category, tags, dashboard_data, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [uid, name, description, category, tags, dashboardData, req.user.id]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create template' });
+  }
+});
+
+app.post('/api/templates/:uid/use', authenticateToken, async (req, res) => {
+  try {
+    // Increment download count
+    await pool.query('UPDATE templates SET downloads = downloads + 1 WHERE uid = $1', [req.params.uid]);
+    
+    // Get template
+    const result = await pool.query('SELECT * FROM templates WHERE uid = $1', [req.params.uid]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to use template' });
+  }
+});
+
+// ==================== DATA SOURCES ====================
+
+app.get('/api/datasources', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM datasources ORDER BY name');
+    res.json({ datasources: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch datasources' });
+  }
+});
+
+// ==================== METRICS & QUERIES ====================
+
+app.get('/api/metrics', async (req, res) => {
+  try {
+    const { metric = 'cpu_usage' } = req.query;
+    
+    // Generate mock time series data
+    const dataPoints = [];
+    const now = new Date();
+    
+    for (let i = 50; i >= 0; i--) {
+      const timestamp = new Date(now - i * 60000);
+      const value = Math.random() * 100;
+      dataPoints.push({
+        timestamp: timestamp.toISOString(),
+        value: Math.round(value * 100) / 100
+      });
+    }
+    
+    res.json({ metric, data: dataPoints });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch metrics' });
+  }
+});
+
+app.post('/api/query', authenticateToken, async (req, res) => {
+  try {
+    const { datasource, query, metric } = req.body;
+    
+    // Mock query result
+    res.json({
+      datasource,
+      query,
+      result: {
+        fields: ['timestamp', 'value'],
+        rows: [
+          [new Date(), 42.5],
+          [new Date(Date.now() - 60000), 38.2],
+          [new Date(Date.now() - 120000), 45.1]
+        ]
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Query failed' });
+  }
+});
+
+// ==================== UTILITIES ====================
+
+function generateUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    message: 'Backend is running',
+    timestamp: new Date(),
+    uptime: process.uptime(),
+    database: 'connected'
+  });
+});
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+  🚀 Server is running!
+  📡 Port: ${PORT}
+  🏥 Health: http://localhost:${PORT}/health
+  🔐 Auth: Enabled
+  💾 Database: PostgreSQL
+  📊 API: http://localhost:${PORT}/api
+  `);
+});
