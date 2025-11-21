@@ -1,10 +1,24 @@
 import React, { useState, useEffect } from 'react';
-import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer
+} from 'recharts';
 import axios from 'axios';
 
 const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
 
-function Panel({ panel, timeRange, onRemove, onEdit, onUpdate }) {
+function Panel({ panel, timeRange, token, refreshTick, onRemove, onEdit, onUpdate }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
@@ -13,25 +27,66 @@ function Panel({ panel, timeRange, onRemove, onEdit, onUpdate }) {
 
   useEffect(() => {
     fetchData();
-    // eslint-disable-next-line
-  }, [panel.id, timeRange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel.id, panel.datasource, timeRange, token, refreshTick]);
 
   const fetchData = async () => {
     setLoading(true);
+
+    const primaryTarget =
+      Array.isArray(panel.targets) && panel.targets.length > 0
+        ? panel.targets[0]
+        : null;
+
+    const ds = panel.datasource || 'mock';
+
+    // ưu tiên lấy query từ targets, nếu không có thì dùng panel.query
+    const queryText =
+      (primaryTarget && primaryTarget.query) ||
+      panel.query ||
+      null;
+
     try {
-      const res = await axios.get('http://localhost:4000/api/metrics', {
-        params: {
-          datasource: panel.datasource || 'mock',
-          metric: panel.metric || 'cpu_usage',
-          from: timeRange.from,
-          to: timeRange.to
-        }
-      });
-      const responseData = res.data;
-      const dataPoints = responseData.data || [];
-      setData(dataPoints);
+      // Case 1: Prometheus hoặc PostgreSQL với query cụ thể (PromQL / SQL)
+      if (
+        queryText &&
+        (ds === 'prometheus' || ds === 'postgres')
+      ) {
+        const res = await axios.post(
+          'http://localhost:4000/api/query',
+          {
+            datasource: ds,
+            query: queryText,
+            from: timeRange.from,
+            to: timeRange.to
+          },
+          token
+            ? { headers: { Authorization: `Bearer ${token}` } }
+            : {}
+        );
+
+        const responseData = res.data.result || {};
+        setData(responseData.data || []);
+      } else {
+        // Case 2: fallback – dùng API metrics cũ (mock hoặc metric đơn giản)
+        const res = await axios.get('http://localhost:4000/api/metrics', {
+          params: {
+            datasource: ds,
+            metric:
+              panel.metric ||
+              (primaryTarget && primaryTarget.metric) ||
+              'cpu_usage',
+            from: timeRange.from,
+            to: timeRange.to
+          }
+        });
+
+        const responseData = res.data;
+        setData(responseData.data || []);
+      }
     } catch (err) {
-      console.error('Error fetching data:', err);
+      console.error('Fetch data error:', err);
+      setData([]);
     } finally {
       setLoading(false);
     }
@@ -73,8 +128,8 @@ function Panel({ panel, timeRange, onRemove, onEdit, onUpdate }) {
       <div className="panel-header">
         <div className="panel-drag-handle">⋮⋮</div>
         {isEditing ? (
-          <input 
-            type="text" 
+          <input
+            type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             className="panel-title-edit"
@@ -98,7 +153,7 @@ function Panel({ panel, timeRange, onRemove, onEdit, onUpdate }) {
           )}
         </div>
       </div>
-      
+
       <div className="panel-content">
         {isEditing && (
           <div className="panel-type-selector">
@@ -123,18 +178,24 @@ function GraphVisualization({ data }) {
     <ResponsiveContainer width="100%" height="100%">
       <LineChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#2c2c2f" />
-        <XAxis 
-          dataKey="timestamp" 
+        <XAxis
+          dataKey="timestamp"
           stroke="#9b9b9b"
           tickFormatter={(ts) => new Date(ts).toLocaleTimeString()}
         />
         <YAxis stroke="#9b9b9b" />
-        <Tooltip 
+        <Tooltip
           contentStyle={{ background: '#1f1f23', border: '1px solid #2c2c2f' }}
           labelStyle={{ color: '#d8d9da' }}
         />
         <Legend />
-        <Line type="monotone" dataKey="value" stroke="#3b82f6" strokeWidth={2} dot={false} />
+        <Line
+          type="monotone"
+          dataKey="value"
+          stroke="#3b82f6"
+          strokeWidth={2}
+          dot={false}
+        />
       </LineChart>
     </ResponsiveContainer>
   );
@@ -145,9 +206,15 @@ function BarVisualization({ data }) {
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#2c2c2f" />
-        <XAxis dataKey="timestamp" stroke="#9b9b9b" tickFormatter={(ts) => new Date(ts).toLocaleTimeString()} />
+        <XAxis
+          dataKey="timestamp"
+          stroke="#9b9b9b"
+          tickFormatter={(ts) => new Date(ts).toLocaleTimeString()}
+        />
         <YAxis stroke="#9b9b9b" />
-        <Tooltip contentStyle={{ background: '#1f1f23', border: '1px solid #2c2c2f' }} />
+        <Tooltip
+          contentStyle={{ background: '#1f1f23', border: '1px solid #2c2c2f' }}
+        />
         <Bar dataKey="value" fill="#3b82f6" />
       </BarChart>
     </ResponsiveContainer>
@@ -194,8 +261,12 @@ function StatVisualization({ data }) {
       <div className="stat-value">{latest.toFixed(2)}</div>
       <div className="stat-label">Current Value</div>
       <div className={`stat-trend ${change >= 0 ? 'positive' : 'negative'}`}>
-        {change >= 0 ? '↑' : '↓'} {Math.abs(changePercent).toFixed(1)}% 
-        <span className="stat-change"> ({change >= 0 ? '+' : ''}{change.toFixed(2)})</span>
+        {change >= 0 ? '↑' : '↓'} {Math.abs(changePercent).toFixed(1)}%
+        <span className="stat-change">
+          {' '}
+          ({change >= 0 ? '+' : ''}
+          {change.toFixed(2)})
+        </span>
       </div>
     </div>
   );
@@ -212,12 +283,15 @@ function TableVisualization({ data }) {
           </tr>
         </thead>
         <tbody>
-          {data.slice(-10).reverse().map((row, idx) => (
-            <tr key={idx}>
-              <td>{new Date(row.timestamp).toLocaleString()}</td>
-              <td>{row.value.toFixed(2)}</td>
-            </tr>
-          ))}
+          {data
+            .slice(-10)
+            .reverse()
+            .map((row, idx) => (
+              <tr key={idx}>
+                <td>{new Date(row.timestamp).toLocaleString()}</td>
+                <td>{row.value.toFixed(2)}</td>
+              </tr>
+            ))}
         </tbody>
       </table>
     </div>

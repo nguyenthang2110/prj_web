@@ -275,12 +275,12 @@ function QueryBuilder({ datasource, onQueryChange, initialQuery }) {
             )}
             {datasource === 'postgres' && (
               <div className="hint">
-                <code>SELECT * FROM metrics WHERE time > now() - interval '1 hour'</code>
+                <code>SELECT * FROM metrics WHERE time &gt; now() - interval '1 hour'</code>
               </div>
             )}
             {datasource === 'influxdb' && (
               <div className="hint">
-                <code>SELECT mean("value") FROM "cpu" WHERE time > now() - 1h GROUP BY time(5m)</code>
+                <code>SELECT mean("value") FROM "cpu" WHERE time &gt; now() - 1h GROUP BY time(5m)</code>
               </div>
             )}
           </div>

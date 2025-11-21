@@ -125,14 +125,6 @@ class DataSourceManager {
       aggregation = 'AVG',
     } = options;
 
-    if (rawQuery) {
-      const rows = await postgres.query(rawQuery);
-      return {
-        type: 'raw',
-        data: rows
-      };
-    }
-
     const data = await postgres.queryTimeSeries({
       table,
       metric,

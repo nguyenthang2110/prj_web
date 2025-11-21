@@ -12,6 +12,7 @@ import Variables from './components/Variables';
 import Alerts from './components/Alerts';
 import Templates from './components/Templates';
 import axios from 'axios';
+import AddPanelModal from './components/AddPanelModal';
 
 const API_URL = 'http://localhost:4000/api';
 
@@ -28,6 +29,10 @@ function App() {
   const [editingPanel, setEditingPanel] = useState(null);
   const [currentPage, setCurrentPage] = useState('dashboard');
   const [showExportImport, setShowExportImport] = useState(false);
+  const [showAddPanelModal, setShowAddPanelModal] = useState(false);
+
+  // tick dùng để ép panel refetch data
+  const [refreshTick, setRefreshTick] = useState(0);
 
   // Check for existing session
   useEffect(() => {
@@ -54,11 +59,11 @@ function App() {
     }
   }, [currentDashboard, token]);
 
-  // Auto-refresh
+  // Auto-refresh: chỉ tăng refreshTick, panel sẽ tự gọi fetchData
   useEffect(() => {
     if (autoRefresh && currentDashboard && token) {
       const interval = setInterval(() => {
-        fetchPanels(currentDashboard.uid);
+        setRefreshTick((prev) => prev + 1);
       }, autoRefresh * 1000);
       return () => clearInterval(interval);
     }
@@ -82,6 +87,7 @@ function App() {
   };
 
   const fetchPanels = async (dashboardUid) => {
+    if (!dashboardUid) return;
     try {
       const res = await axios.get(`${API_URL}/dashboards/${dashboardUid}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -138,35 +144,48 @@ function App() {
       await axios.delete(`${API_URL}/dashboards/${uid}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setDashboards(dashboards.filter(d => d.uid !== uid));
+      const remain = dashboards.filter(d => d.uid !== uid);
+      setDashboards(remain);
       if (currentDashboard?.uid === uid) {
-        setCurrentDashboard(dashboards[0] || null);
+        setCurrentDashboard(remain[0] || null);
       }
     } catch (err) {
       console.error('Error deleting dashboard:', err);
     }
   };
 
-  const addPanel = async () => {
+  const handleOpenAddPanel = () => {
+    setShowAddPanelModal(true);
+  };
+
+  const handleCreatePanelFromPreset = async (preset) => {
     if (!currentDashboard) return;
 
-    const newPanel = {
-      title: 'New Panel',
-      type: 'graph',
+    const newPanelPayload = {
+      title: preset.title,
+      type: preset.type || 'graph',
       position: { x: 0, y: 0, w: 6, h: 4 },
-      datasource: 'postgresql',
-      metric: 'cpu_usage',
-      targets: [],
+      datasource: preset.datasource,
+      targets: [
+        {
+          refId: 'A',
+          datasource: preset.datasource,
+          query: preset.query
+        }
+      ],
       options: {}
     };
 
     try {
-      const res = await axios.post(`${API_URL}/dashboards/${currentDashboard.id}/panels`, newPanel, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setPanels([...panels, res.data]);
+      const res = await axios.post(
+        `${API_URL}/dashboards/${currentDashboard.id}/panels`,
+        newPanelPayload,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setPanels(prev => [...prev, res.data]);
     } catch (err) {
       console.error('Error adding panel:', err);
+      alert('Không tạo được panel, xem log console.');
     }
   };
 
@@ -186,7 +205,7 @@ function App() {
       const res = await axios.put(`${API_URL}/panels/${panelId}`, updates, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setPanels(panels.map(p => p.id === panelId ? res.data : p));
+      setPanels(panels.map(p => (p.id === panelId ? res.data : p)));
     } catch (err) {
       console.error('Error updating panel:', err);
     }
@@ -208,10 +227,13 @@ function App() {
     if (!currentDashboard) return;
 
     try {
-      const res = await axios.get(`${API_URL}/dashboards/${currentDashboard.uid}/export`, {
-        headers: { Authorization: `Bearer ${token}` },
-        responseType: 'blob'
-      });
+      const res = await axios.get(
+        `${API_URL}/dashboards/${currentDashboard.uid}/export`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          responseType: 'blob'
+        }
+      );
       
       const url = window.URL.createObjectURL(new Blob([res.data]));
       const link = document.createElement('a');
@@ -240,6 +262,15 @@ function App() {
       console.error('Import error:', err);
       alert('Failed to import dashboard');
     }
+  };
+
+  const handleManualRefresh = () => {
+    // reload cấu trúc panel (nếu có panel mới/sửa/xoá)
+    if (currentDashboard) {
+      fetchPanels(currentDashboard.uid);
+    }
+    // ép tất cả panel refetch dữ liệu
+    setRefreshTick(prev => prev + 1);
   };
 
   // Show login if not authenticated
@@ -283,7 +314,9 @@ function App() {
               <select 
                 className="refresh-select"
                 value={autoRefresh || ''}
-                onChange={(e) => setAutoRefresh(e.target.value ? parseInt(e.target.value) : null)}
+                onChange={(e) =>
+                  setAutoRefresh(e.target.value ? parseInt(e.target.value) : null)
+                }
               >
                 <option value="">Off</option>
                 <option value="5">5s</option>
@@ -291,7 +324,11 @@ function App() {
                 <option value="30">30s</option>
                 <option value="60">1m</option>
               </select>
-              <button className="nav-btn" onClick={() => fetchPanels(currentDashboard?.uid)}>
+              <button
+                className="nav-btn"
+                onClick={handleManualRefresh}
+                title="Refresh now"
+              >
                 🔄
               </button>
             </>
@@ -312,13 +349,22 @@ function App() {
             <div className="sidebar-section">
               <h3>Navigation</h3>
               <ul className="nav-list">
-                <li className={currentPage === 'dashboard' ? 'active' : ''} onClick={() => setCurrentPage('dashboard')}>
+                <li
+                  className={currentPage === 'dashboard' ? 'active' : ''}
+                  onClick={() => setCurrentPage('dashboard')}
+                >
                   📊 Dashboards
                 </li>
-                <li className={currentPage === 'alerts' ? 'active' : ''} onClick={() => setCurrentPage('alerts')}>
+                <li
+                  className={currentPage === 'alerts' ? 'active' : ''}
+                  onClick={() => setCurrentPage('alerts')}
+                >
                   🔔 Alerts
                 </li>
-                <li className={currentPage === 'templates' ? 'active' : ''} onClick={() => setCurrentPage('templates')}>
+                <li
+                  className={currentPage === 'templates' ? 'active' : ''}
+                  onClick={() => setCurrentPage('templates')}
+                >
                   📄 Templates
                 </li>
               </ul>
@@ -372,10 +418,13 @@ function App() {
               <div className="dashboard-header">
                 <h2>{currentDashboard.title}</h2>
                 <div className="dashboard-controls">
-                  <button className="btn" onClick={addPanel}>
+                  <button className="btn" onClick={handleOpenAddPanel}>
                     ➕ Add Panel
                   </button>
-                  <button className="btn" onClick={() => setShowExportImport(true)}>
+                  <button
+                    className="btn"
+                    onClick={() => setShowExportImport(true)}
+                  >
                     📥 Import/Export
                   </button>
                   <button className="btn">💾 Save</button>
@@ -409,6 +458,8 @@ function App() {
                     <Panel 
                       panel={panel}
                       timeRange={timeRange}
+                      token={token}
+                      refreshTick={refreshTick}
                       onRemove={removePanel}
                       onEdit={(p) => {
                         setEditingPanel(p);
@@ -423,10 +474,12 @@ function App() {
           ) : currentPage === 'alerts' ? (
             <Alerts />
           ) : currentPage === 'templates' ? (
-            <Templates onUseTemplate={(template) => {
-              console.log('Using template:', template);
-              // Import template as new dashboard
-            }} />
+            <Templates
+              onUseTemplate={(template) => {
+                console.log('Using template:', template);
+                // Import template as new dashboard
+              }}
+            />
           ) : (
             <div className="empty-state">
               <h2>No dashboard selected</h2>
@@ -459,6 +512,13 @@ function App() {
           onImport={importDashboard}
         />
       )}
+
+      {/* Add Panel Modal */}
+      <AddPanelModal
+        isOpen={showAddPanelModal}
+        onClose={() => setShowAddPanelModal(false)}
+        onCreate={handleCreatePanelFromPreset}
+      />
     </div>
   );
 }
@@ -474,7 +534,10 @@ function ExportImportModal({ onClose, onExport, onImport }) {
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="query-editor-modal small-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="query-editor-modal small-modal"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="modal-header">
           <h3>Import / Export Dashboard</h3>
           <button className="close-btn" onClick={onClose}>✕</button>
@@ -485,10 +548,13 @@ function ExportImportModal({ onClose, onExport, onImport }) {
             <div className="action-card">
               <h4>📤 Export</h4>
               <p>Download dashboard as JSON file</p>
-              <button className="btn-primary" onClick={() => {
-                onExport();
-                onClose();
-              }}>
+              <button
+                className="btn-primary"
+                onClick={() => {
+                  onExport();
+                  onClose();
+                }}
+              >
                 Export Dashboard
               </button>
             </div>
@@ -503,7 +569,11 @@ function ExportImportModal({ onClose, onExport, onImport }) {
                 style={{ display: 'none' }}
                 id="import-file"
               />
-              <label htmlFor="import-file" className="btn-primary" style={{ cursor: 'pointer' }}>
+              <label
+                htmlFor="import-file"
+                className="btn-primary"
+                style={{ cursor: 'pointer' }}
+              >
                 Choose File
               </label>
             </div>
