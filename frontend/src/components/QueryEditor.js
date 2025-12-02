@@ -2,10 +2,8 @@ import React, { useState } from 'react';
 import axios from 'axios';
 
 const DATASOURCES = [
-  { id: 'mock', name: 'Mock Data', type: 'mock' },
   { id: 'prometheus', name: 'Prometheus', type: 'prometheus' },
-  { id: 'postgres', name: 'PostgreSQL', type: 'postgres' },
-  { id: 'influxdb', name: 'InfluxDB', type: 'influxdb' }
+  { id: 'postgres', name: 'PostgreSQL', type: 'postgres' }
 ];
 
 const METRICS = [
@@ -19,7 +17,7 @@ const METRICS = [
 ];
 
 function QueryEditor({ panel, onClose, onSave }) {
-  const [datasource, setDatasource] = useState(panel.datasource || 'mock');
+  const [datasource, setDatasource] = useState(panel.datasource || 'prometheus');
   const [metric, setMetric] = useState(panel.metric || 'cpu_usage');
   const [query, setQuery] = useState(panel.query || '');
   const [interval, setInterval] = useState(panel.interval || '1m');

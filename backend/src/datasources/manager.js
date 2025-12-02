@@ -5,6 +5,7 @@ class DataSourceManager {
   constructor() {
     this.dataSources = new Map();
     this.initialized = false;
+    this.logs = new Map(); // store per-datasource logs
   }
 
   async initialize() {
@@ -14,8 +15,10 @@ class DataSourceManager {
       
       if (await prometheus.testConnection()) {
         this.dataSources.set('prometheus', prometheus);
+        this.pushLog('prometheus', 'Connected to Prometheus');
         console.log('✅ Prometheus data source connected');
       } else {
+        this.pushLog('prometheus', 'Prometheus not available', 'warn');
         console.log('⚠️  Prometheus not available');
       }
 
@@ -28,14 +31,18 @@ class DataSourceManager {
       
       if (await postgres.testConnection()) {
         this.dataSources.set('postgres', postgres);
+        this.pushLog('postgres', 'Connected to PostgreSQL');
         console.log('✅ PostgreSQL data source connected');
       } else {
+        this.pushLog('postgres', 'PostgreSQL not available', 'warn');
         console.log('⚠️  PostgreSQL not available');
       }
 
       this.initialized = true;
+      this.pushLog('manager', 'DataSourceManager initialized');
     } catch (error) {
       console.error('Error initializing data sources:', error);
+      this.pushLog('manager', `Init error: ${error.message}`, 'error');
     }
   }
 
@@ -49,11 +56,7 @@ class DataSourceManager {
 
   async query(options) {
     const {
-      datasource = 'mock',
-      metric,
-      from = 'now-1h',
-      to = 'now',
-      query: rawQuery
+      datasource = 'prometheus'
     } = options;
 
     try {
@@ -64,13 +67,13 @@ class DataSourceManager {
         case 'postgres':
           return await this.queryPostgreSQL(options);
         
-        case 'mock':
         default:
-          return this.generateMockData(options);
+          throw new Error(`Unsupported datasource: ${datasource}`);
       }
     } catch (error) {
       console.error(`Error querying ${datasource}:`, error);
-      return this.generateMockData(options);
+      this.pushLog(datasource, `Query error: ${error.message}`, 'error');
+      throw error;
     }
   }
 
@@ -97,6 +100,7 @@ class DataSourceManager {
       rateInterval: '5m'
     });
 
+    this.pushLog('prometheus', `Query: ${query} from ${from} to ${to}`);
     const data = await prometheus.queryRange(query, from, to);
 
     if (Array.isArray(data) && data[0]?.metric) {
@@ -112,26 +116,77 @@ class DataSourceManager {
     };
   }
 
-  async queryPostgreSQL(options) {
+  async queryPostgreSQL(options = {}) {
     const postgres = this.getDataSource('postgres');
     if (!postgres) {
       throw new Error('PostgreSQL not available');
     }
 
     const {
-      metric='cpu_usage',
-      from = "now() - interval '1 hour'",
-      to = 'now()',
+      metric = 'cpu_usage',
+      query: rawQuery,             // map field query → rawQuery
+      table = 'metrics',           // bảng mặc định chứa time-series
+      timeColumn = 'timestamp',
+      valueColumn = 'value',
+      metricColumn = 'metric_name',
+      from = 'now-1h',
+      to = 'now',
       aggregation = 'AVG',
+      groupBy = []                 // groupBy mặc định là mảng rỗng
     } = options;
 
+    const range = this.resolveTimeRange(from, to);
+    const selectedValueColumn = valueColumn || 'value';
+
+    // Nếu có custom raw query thì chạy luôn
+    if (rawQuery) {
+      const interpolatedQuery = this.interpolateSQLTimeRange(rawQuery, range);
+      const rows = await postgres.query(interpolatedQuery);
+      const hasTimeField =
+        rows.length > 0 &&
+        (rows[0].time || rows[0].timestamp || rows[0].ts || rows[0].date);
+      const hasValueField =
+        rows.length > 0 && (rows[0].value !== undefined || rows[0].val !== undefined);
+
+      if (hasTimeField && hasValueField) {
+        const timeField = rows[0].time
+          ? 'time'
+          : rows[0].timestamp
+          ? 'timestamp'
+          : rows[0].ts
+          ? 'ts'
+          : 'date';
+        const valueField = rows[0].value !== undefined ? 'value' : 'val';
+
+        const normalized = rows.map((row) => ({
+          timestamp: new Date(row[timeField]).toISOString(),
+          value: parseFloat(row[valueField])
+        }));
+
+        return {
+          type: 'timeseries',
+          data: normalized
+        };
+      }
+
+      return {
+        type: 'raw',
+        data: rows
+      };
+    }
+
+    // Còn không thì dùng helper queryTimeSeries
     const data = await postgres.queryTimeSeries({
       table,
+      timeColumn,
+      valueColumn: selectedValueColumn,
+      metricColumn,
       metric,
-      from,
-      to,
+      from: range.from,
+      to: range.to,
       aggregation,
-      groupBy
+      groupBy,
+      logger: (msg) => this.pushLog('postgres', msg)
     });
 
     return {
@@ -140,58 +195,48 @@ class DataSourceManager {
     };
   }
 
-  generateMockData(options) {
-    const { metric = 'cpu_usage', from = 'now-1h' } = options;
+  resolveTimeRange(from, to) {
+    const parseTime = (value, fallbackNow = false) => {
+      if (!value && fallbackNow) return new Date();
+      if (value === 'now') return new Date();
 
-    const dataPoints = [];
-    const now = new Date();
-    const duration = this.parseDuration(from);
-    const points = Math.min(duration / 60, 100);
+      const relative = /^now-(\d+)([smhdw])$/i;
+      const match = typeof value === 'string' ? value.match(relative) : null;
+      if (match) {
+        const amount = parseInt(match[1], 10);
+        const unit = match[2].toLowerCase();
+        const multipliers = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+        const seconds = amount * (multipliers[unit] || 0);
+        return new Date(Date.now() - seconds * 1000);
+      }
 
-    for (let i = points; i >= 0; i--) {
-      const timestamp = new Date(now - i * (duration / points) * 1000);
-      const value = Math.random() * 100;
-      
-      dataPoints.push({
-        timestamp: timestamp.toISOString(),
-        value: Math.round(value * 100) / 100
-      });
-    }
-
-    return {
-      type: 'mock',
-      data: dataPoints
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) {
+        return new Date();
+      }
+      return dt;
     };
+
+    const toDate = parseTime(to, true);
+    const fromDate = parseTime(from, true);
+
+    return { from: fromDate, to: toDate };
   }
 
-  parseDuration(timeStr) {
-    const match = timeStr.match(/now-(\d+)([smhdw])/);
-    if (!match) return 3600;
+  interpolateSQLTimeRange(sql, range) {
+    if (!sql) return sql;
+    const fromISO = range.from.toISOString();
+    const toISO = range.to.toISOString();
 
-    const value = parseInt(match[1]);
-    const unit = match[2];
-
-    const multipliers = {
-      's': 1,
-      'm': 60,
-      'h': 3600,
-      'd': 86400,
-      'w': 604800
-    };
-
-    return value * multipliers[unit];
+    return sql
+      .replace(/\$__from/g, `'${fromISO}'`)
+      .replace(/\$__to/g, `'${toISO}'`);
   }
 
   async getAvailableMetrics() {
     const metrics = {
       prometheus: [],
-      postgres: [],
-      mock: [
-        'cpu_usage',
-        'memory_usage',
-        'disk_io',
-        'network_traffic'
-      ]
+      postgres: []
     };
 
     const prometheus = this.getDataSource('prometheus');
@@ -206,6 +251,7 @@ class DataSourceManager {
     const postgres = this.getDataSource('postgres');
     if (postgres) {
       try {
+        // Ưu tiên lấy metric_name trong bảng metrics
         const rows = await postgres.query(`
           SELECT DISTINCT metric_name 
           FROM metrics 
@@ -213,7 +259,20 @@ class DataSourceManager {
         `);
         metrics.postgres = rows.map(r => r.metric_name);
       } catch (error) {
-        console.error('Error fetching PostgreSQL metrics:', error);
+        console.error('Error fetching PostgreSQL metrics from metrics table:', error);
+        // Fallback: nếu dùng host_metrics dạng cột, lấy các cột (trừ cột thời gian)
+        try {
+          const rows = await postgres.query(`
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'host_metrics'
+              AND column_name NOT IN ('ts', 'timestamp', 'time')
+            ORDER BY column_name
+          `);
+          metrics.postgres = rows.map(r => r.column_name);
+        } catch (err2) {
+          console.error('Error fetching PostgreSQL metrics from host_metrics:', err2);
+        }
       }
     }
 
@@ -240,6 +299,29 @@ class DataSourceManager {
         await ds.close();
       }
     }
+  }
+
+  pushLog(type, message, level = 'info') {
+    if (!this.logs.has(type)) {
+      this.logs.set(type, []);
+    }
+    const arr = this.logs.get(type);
+    arr.push({
+      level,
+      message,
+      timestamp: new Date().toISOString()
+    });
+    if (arr.length > 200) {
+      arr.shift();
+    }
+  }
+
+  getLogs(type) {
+    return this.logs.get(type) || [];
+  }
+
+  clearLogs(type) {
+    this.logs.set(type, []);
   }
 }
 

@@ -42,9 +42,6 @@ function QueryBuilder({ datasource, onQueryChange, initialQuery }) {
       case 'postgres':
         query = generateSQLQuery();
         break;
-      case 'influxdb':
-        query = generateInfluxQuery();
-        break;
       default:
         query = generateGenericQuery();
     }
@@ -93,25 +90,6 @@ function QueryBuilder({ datasource, onQueryChange, initialQuery }) {
     }
     
     query += ` ORDER BY time DESC LIMIT 1000`;
-    
-    return query;
-  };
-
-  const generateInfluxQuery = () => {
-    let query = `SELECT ${builderState.aggregation}("${builderState.metric}") FROM "metrics"`;
-    
-    if (builderState.filters.length > 0) {
-      const where = builderState.filters
-        .map(f => `"${f.field}" ${f.operator} '${f.value}'`)
-        .join(' AND ');
-      query += ` WHERE ${where}`;
-    }
-    
-    query += ` AND time > now() - ${builderState.timeRange}`;
-    
-    if (builderState.groupBy.length > 0) {
-      query += ` GROUP BY ${builderState.groupBy.map(g => `"${g}"`).join(', ')}`;
-    }
     
     return query;
   };
@@ -276,11 +254,6 @@ function QueryBuilder({ datasource, onQueryChange, initialQuery }) {
             {datasource === 'postgres' && (
               <div className="hint">
                 <code>SELECT * FROM metrics WHERE time &gt; now() - interval '1 hour'</code>
-              </div>
-            )}
-            {datasource === 'influxdb' && (
-              <div className="hint">
-                <code>SELECT mean("value") FROM "cpu" WHERE time &gt; now() - 1h GROUP BY time(5m)</code>
               </div>
             )}
           </div>

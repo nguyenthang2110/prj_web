@@ -1,5 +1,5 @@
 // frontend/src/App.js - Complete with Authentication
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import GridLayout from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
@@ -8,9 +8,7 @@ import Login from './components/Login';
 import TimeRangePicker from './components/TimeRangePicker';
 import Panel from './components/Panel';
 import QueryEditor from './components/QueryEditor';
-import Variables from './components/Variables';
 import Alerts from './components/Alerts';
-import Templates from './components/Templates';
 import axios from 'axios';
 import AddPanelModal from './components/AddPanelModal';
 
@@ -30,6 +28,9 @@ function App() {
   const [currentPage, setCurrentPage] = useState('dashboard');
   const [showExportImport, setShowExportImport] = useState(false);
   const [showAddPanelModal, setShowAddPanelModal] = useState(false);
+  const [dataSources, setDataSources] = useState([]);
+  const [showAccountModal, setShowAccountModal] = useState(false);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
 
   // tick dùng để ép panel refetch data
   const [refreshTick, setRefreshTick] = useState(0);
@@ -46,64 +47,7 @@ function App() {
   }, []);
 
   // Fetch dashboards when logged in
-  useEffect(() => {
-    if (token) {
-      fetchDashboards();
-    }
-  }, [token]);
-
-  // Load panels when dashboard changes
-  useEffect(() => {
-    if (currentDashboard && token) {
-      fetchPanels(currentDashboard.uid);
-    }
-  }, [currentDashboard, token]);
-
-  // Auto-refresh: chỉ tăng refreshTick, panel sẽ tự gọi fetchData
-  useEffect(() => {
-    if (autoRefresh && currentDashboard && token) {
-      const interval = setInterval(() => {
-        setRefreshTick((prev) => prev + 1);
-      }, autoRefresh * 1000);
-      return () => clearInterval(interval);
-    }
-  }, [autoRefresh, currentDashboard, token]);
-
-  const fetchDashboards = async () => {
-    try {
-      const res = await axios.get(`${API_URL}/dashboards`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setDashboards(res.data.dashboards);
-      if (res.data.dashboards.length > 0 && !currentDashboard) {
-        setCurrentDashboard(res.data.dashboards[0]);
-      }
-    } catch (err) {
-      console.error('Error fetching dashboards:', err);
-      if (err.response?.status === 401) {
-        handleLogout();
-      }
-    }
-  };
-
-  const fetchPanels = async (dashboardUid) => {
-    if (!dashboardUid) return;
-    try {
-      const res = await axios.get(`${API_URL}/dashboards/${dashboardUid}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setPanels(res.data.panels || []);
-    } catch (err) {
-      console.error('Error fetching panels:', err);
-    }
-  };
-
-  const handleLoginSuccess = (userData, userToken) => {
-    setUser(userData);
-    setToken(userToken);
-  };
-
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     try {
       await axios.post(`${API_URL}/auth/logout`, {}, {
         headers: { Authorization: `Bearer ${token}` }
@@ -119,6 +63,76 @@ function App() {
       setCurrentDashboard(null);
       setPanels([]);
     }
+  }, [token]);
+
+  const fetchDashboards = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API_URL}/dashboards`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setDashboards(res.data.dashboards);
+      if (res.data.dashboards.length > 0 && !currentDashboard) {
+        setCurrentDashboard(res.data.dashboards[0]);
+      }
+    } catch (err) {
+      console.error('Error fetching dashboards:', err);
+      if (err.response?.status === 401) {
+        handleLogout();
+      }
+    }
+  }, [token, currentDashboard, handleLogout]);
+
+  const fetchDataSources = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API_URL}/datasources`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setDataSources(res.data.datasources || []);
+    } catch (err) {
+      console.error('Error fetching datasources:', err);
+    }
+  }, [token]);
+
+  const fetchPanels = useCallback(async (dashboardUid) => {
+    if (!dashboardUid) return;
+    try {
+      const res = await axios.get(`${API_URL}/dashboards/${dashboardUid}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setPanels(res.data.panels || []);
+    } catch (err) {
+      console.error('Error fetching panels:', err);
+    }
+  }, [token]);
+
+  // Fetch dashboards when logged in
+  useEffect(() => {
+    if (token) {
+      fetchDashboards();
+      fetchDataSources();
+    }
+  }, [token, fetchDashboards, fetchDataSources]);
+
+  // Load panels when dashboard changes
+  useEffect(() => {
+    if (currentDashboard && token) {
+      fetchPanels(currentDashboard.uid);
+    }
+  }, [currentDashboard, token, fetchPanels]);
+
+  // Auto-refresh: chỉ tăng refreshTick, panel sẽ tự gọi fetchData
+  useEffect(() => {
+    if (autoRefresh && currentDashboard && token) {
+      const interval = setInterval(() => {
+        setRefreshTick((prev) => prev + 1);
+      }, autoRefresh * 1000);
+      return () => clearInterval(interval);
+    }
+  }, [autoRefresh, currentDashboard, token]);
+
+  const handleLoginSuccess = (userData, userToken) => {
+    setUser(userData);
+    setToken(userToken);
   };
 
   const createDashboard = async () => {
@@ -202,7 +216,9 @@ function App() {
 
   const updatePanel = async (panelId, updates) => {
     try {
-      const res = await axios.put(`${API_URL}/panels/${panelId}`, updates, {
+      const existing = panels.find(p => p.id === panelId);
+      const payload = existing ? { ...existing, ...updates } : updates;
+      const res = await axios.put(`${API_URL}/panels/${panelId}`, payload, {
         headers: { Authorization: `Bearer ${token}` }
       });
       setPanels(panels.map(p => (p.id === panelId ? res.data : p)));
@@ -333,12 +349,41 @@ function App() {
               </button>
             </>
           )}
-          <button className="nav-btn" title={`Logged in as ${user.username}`}>
-            👤
-          </button>
-          <button className="nav-btn" onClick={handleLogout} title="Logout">
-            🚪
-          </button>
+          <div className="account-wrapper">
+            <button
+              className="nav-btn"
+              title={`Logged in as ${user.username}`}
+              onClick={() => setShowAccountMenu((prev) => !prev)}
+            >
+              👤
+            </button>
+            {showAccountMenu && (
+              <div className="account-menu">
+                <div className="account-menu-header">
+                  <div className="account-name">{user?.username}</div>
+                  <div className="account-email">{user?.email}</div>
+                </div>
+                <button
+                  className="account-menu-item"
+                  onClick={() => {
+                    setShowAccountModal(true);
+                    setShowAccountMenu(false);
+                  }}
+                >
+                  🔒 Change Password
+                </button>
+                <button
+                  className="account-menu-item"
+                  onClick={() => {
+                    setShowAccountMenu(false);
+                    handleLogout();
+                  }}
+                >
+                  🚪 Logout
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </nav>
 
@@ -362,10 +407,10 @@ function App() {
                   🔔 Alerts
                 </li>
                 <li
-                  className={currentPage === 'templates' ? 'active' : ''}
-                  onClick={() => setCurrentPage('templates')}
+                  className={currentPage === 'logs' ? 'active' : ''}
+                  onClick={() => setCurrentPage('logs')}
                 >
-                  📄 Templates
+                  🧾 Logs
                 </li>
               </ul>
             </div>
@@ -382,13 +427,15 @@ function App() {
                       <li 
                         key={d.uid}
                         className={currentDashboard?.uid === d.uid ? 'active' : ''}
+                        onClick={() => setCurrentDashboard(d)}
                       >
-                        <span onClick={() => setCurrentDashboard(d)}>
-                          📄 {d.title}
-                        </span>
-                        <button 
+                        <span>📄 {d.title}</span>
+                        <button
                           className="delete-btn"
-                          onClick={() => deleteDashboard(d.uid)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteDashboard(d.uid);
+                          }}
                         >
                           🗑️
                         </button>
@@ -400,10 +447,15 @@ function App() {
                 <div className="sidebar-section">
                   <h3>Data Sources</h3>
                   <ul className="data-source-list">
-                    <li>🗄️ PostgreSQL</li>
-                    <li>📈 Prometheus</li>
-                    <li>⏱️ InfluxDB</li>
-                    <li>📊 Mock Data</li>
+                    {dataSources.length === 0 && (
+                      <li className="muted">No data sources available</li>
+                    )}
+                    {dataSources.map((ds) => (
+                      <li key={ds.id}>
+                        {ds.type === 'postgres' ? '🗄️' : ds.type === 'prometheus' ? '📈' : '🔌'}{' '}
+                        {ds.name || ds.id}
+                      </li>
+                    ))}
                   </ul>
                 </div>
               </>
@@ -421,19 +473,8 @@ function App() {
                   <button className="btn" onClick={handleOpenAddPanel}>
                     ➕ Add Panel
                   </button>
-                  <button
-                    className="btn"
-                    onClick={() => setShowExportImport(true)}
-                  >
-                    📥 Import/Export
-                  </button>
-                  <button className="btn">💾 Save</button>
-                  <button className="btn">⚙️ Settings</button>
                 </div>
               </div>
-
-              {/* Variables */}
-              <Variables dashboardId={currentDashboard.id} />
 
               {/* Dashboard Grid */}
               <GridLayout
@@ -473,13 +514,8 @@ function App() {
             </>
           ) : currentPage === 'alerts' ? (
             <Alerts />
-          ) : currentPage === 'templates' ? (
-            <Templates
-              onUseTemplate={(template) => {
-                console.log('Using template:', template);
-                // Import template as new dashboard
-              }}
-            />
+          ) : currentPage === 'logs' ? (
+            <Logs token={token} />
           ) : (
             <div className="empty-state">
               <h2>No dashboard selected</h2>
@@ -519,6 +555,133 @@ function App() {
         onClose={() => setShowAddPanelModal(false)}
         onCreate={handleCreatePanelFromPreset}
       />
+
+      {showAccountModal && (
+        <AccountModal
+          onClose={() => setShowAccountModal(false)}
+          token={token}
+          user={user}
+        />
+      )}
+    </div>
+  );
+}
+
+function AccountModal({ onClose, token, user }) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [status, setStatus] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [showCurrent, setShowCurrent] = useState(false);
+  const [showNew, setShowNew] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setStatus('');
+    setError('');
+    if (newPassword !== confirmPassword) {
+      setError('New password and confirmation do not match');
+      return;
+    }
+    try {
+      setLoading(true);
+      await axios.post(
+        `${API_URL}/auth/change-password`,
+        { currentPassword, newPassword },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setStatus('Password changed successfully');
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to change password');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="query-editor-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>Account</h3>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <p>Logged in as <strong>{user?.username}</strong> ({user?.email})</p>
+          <form onSubmit={handleSubmit}>
+            <div className="editor-section">
+              <h4>Current Password</h4>
+              <input
+                type={showCurrent ? 'text' : 'password'}
+                className="editor-select"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                required
+              />
+              <div className="inline-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setShowCurrent((prev) => !prev)}
+                >
+                  {showCurrent ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+            <div className="editor-section">
+              <h4>New Password</h4>
+              <input
+                type={showNew ? 'text' : 'password'}
+                className="editor-select"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+              />
+              <div className="inline-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setShowNew((prev) => !prev)}
+                >
+                  {showNew ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+            <div className="editor-section">
+              <h4>Confirm New Password</h4>
+              <input
+                type={showConfirm ? 'text' : 'password'}
+                className="editor-select"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+              />
+              <div className="inline-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setShowConfirm((prev) => !prev)}
+                >
+                  {showConfirm ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+            {error && <div className="error-banner">{error}</div>}
+            {status && <div className="success-banner">{status}</div>}
+            <div className="modal-footer">
+              <button type="button" className="btn" onClick={onClose}>Close</button>
+              <button type="submit" className="btn-primary" disabled={loading}>
+                {loading ? 'Saving...' : 'Change Password'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
     </div>
   );
 }
@@ -585,3 +748,134 @@ function ExportImportModal({ onClose, onExport, onImport }) {
 }
 
 export default App;
+
+function Logs({ token }) {
+  const [dsLogs, setDsLogs] = useState([]);
+  const [dsLoading, setDsLoading] = useState(false);
+  const [datasources, setDatasources] = useState([]);
+  const [selectedDs, setSelectedDs] = useState('');
+  const [page, setPage] = useState(1);
+  const pageSize = 20;
+
+  const fetchDatasources = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API_URL}/datasources`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setDatasources(res.data.datasources || []);
+      if (res.data.datasources?.length) {
+        setSelectedDs(res.data.datasources[0].id);
+      }
+    } catch (err) {
+      console.error('Error fetching datasources:', err);
+    }
+  }, [token]);
+
+  const fetchDsLogs = useCallback(async (id) => {
+    setDsLoading(true);
+    try {
+      const res = await axios.get(`${API_URL}/datasources/${id}/logs`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setDsLogs(res.data.logs || []);
+    } catch (err) {
+      console.error('Error fetching datasource logs:', err);
+    } finally {
+      setDsLoading(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    fetchDatasources();
+  }, [fetchDatasources]);
+
+  useEffect(() => {
+    if (selectedDs) {
+      fetchDsLogs(selectedDs);
+      setPage(1);
+    }
+  }, [selectedDs, fetchDsLogs]);
+
+  const totalPages = Math.max(1, Math.ceil(dsLogs.length / pageSize));
+  const currentPage = Math.min(Math.max(1, page), totalPages);
+  const start = (currentPage - 1) * pageSize;
+  const visibleLogs = dsLogs.slice(start, start + pageSize);
+
+  return (
+    <div className="logs-page">
+      <div className="page-header" style={{ marginTop: 24 }}>
+        <h2>Datasource Logs</h2>
+        <div className="logs-filter-row">
+          <select
+            className="editor-select"
+            value={selectedDs}
+            onChange={(e) => setSelectedDs(e.target.value)}
+          >
+            {datasources.map((ds) => (
+              <option key={ds.id} value={ds.id}>
+                {ds.name || ds.id}
+              </option>
+            ))}
+          </select>
+          <button className="btn" onClick={() => fetchDsLogs(selectedDs)}>🔄</button>
+        </div>
+      </div>
+      {dsLoading ? (
+        <div className="loading-state">
+          <div className="spinner"></div>
+          <p>Loading datasource logs...</p>
+        </div>
+      ) : (
+        <>
+          <div className="logs-list scrollable">
+            {visibleLogs.length === 0 ? (
+              <p>No datasource logs</p>
+            ) : (
+              visibleLogs.map((log, idx) => (
+                <div key={idx} className={`log-item log-${log.level}`}>
+                  <span className="log-time">{new Date(log.timestamp).toLocaleString()}</span>
+                  <span className="log-level">[{log.level?.toUpperCase() || 'INFO'}]</span>
+                  <span className="log-msg">{log.message}</span>
+                </div>
+              ))
+            )}
+          </div>
+            <div className="logs-actions">
+              <div className="pagination">
+                <button
+                  className="btn"
+                  disabled={currentPage <= 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                >
+                  Prev
+                </button>
+                <span className="logs-count">
+                  Page {currentPage} / {totalPages} ({visibleLogs.length}/{dsLogs.length})
+                </span>
+                <button
+                  className="btn"
+                  disabled={currentPage >= totalPages}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                >
+                  Next
+                </button>
+              </div>
+              <button className="btn danger" onClick={async () => {
+                try {
+                  await axios.delete(`${API_URL}/datasources/${selectedDs}/logs`, {
+                    headers: { Authorization: `Bearer ${token}` }
+                  });
+                  setDsLogs([]);
+                  setPage(1);
+                } catch (err) {
+                  alert(err.response?.data?.error || 'Failed to clear logs');
+                }
+              }}>
+                Clear Logs
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

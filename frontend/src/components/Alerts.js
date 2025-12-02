@@ -6,6 +6,10 @@ function Alerts() {
   const [alerts, setAlerts] = useState([]);
   const [showEditor, setShowEditor] = useState(false);
   const [selectedAlert, setSelectedAlert] = useState(null);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [historyModal, setHistoryModal] = useState({ open: false, items: [] });
+  const [historyPage, setHistoryPage] = useState(1);
+  const historyPageSize = 20;
 
   useEffect(() => {
     fetchAlerts();
@@ -18,8 +22,10 @@ function Alerts() {
         headers: { Authorization: `Bearer ${token}` }
       });
       setAlerts(res.data.alerts);
+      setErrorMsg('');
     } catch (err) {
       console.error('Error fetching alerts:', err);
+      setErrorMsg(err.response?.data?.error || 'Failed to fetch alerts');
     }
   };
 
@@ -34,6 +40,20 @@ function Alerts() {
       fetchAlerts();
     } catch (err) {
       console.error('Error deleting alert:', err);
+    }
+  };
+
+  const viewHistory = async (id) => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get(`http://localhost:4000/api/alerts/${id}/history`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setHistoryModal({ open: true, items: res.data.history || [] });
+      setHistoryPage(1);
+    } catch (err) {
+      console.error('Error fetching history:', err);
+      alert('Failed to fetch history');
     }
   };
 
@@ -54,6 +74,8 @@ function Alerts() {
           + Create Alert
         </button>
       </div>
+
+      {errorMsg && <div className="error-banner">{errorMsg}</div>}
 
       <div className="alerts-list">
         {alerts.length === 0 ? (
@@ -96,7 +118,7 @@ function Alerts() {
                 <button className="btn" onClick={() => deleteAlert(alert.id)}>
                   Delete
                 </button>
-                <button className="btn">View History</button>
+                <button className="btn" onClick={() => viewHistory(alert.id)}>View History</button>
               </div>
             </div>
           ))
@@ -117,11 +139,74 @@ function Alerts() {
           }}
         />
       )}
+
+      {historyModal.open && (
+        <div className="modal-overlay" onClick={() => setHistoryModal({ open: false, items: [] })}>
+          <div className="query-editor-modal history-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Alert History</h3>
+              <button className="close-btn" onClick={() => setHistoryModal({ open: false, items: [] })}>✕</button>
+            </div>
+            <div className="modal-body history-body">
+              {historyModal.items.length === 0 ? (
+                <p>No history</p>
+              ) : (
+                <>
+                  <div className="history-header">
+                    <div className="history-col state">State</div>
+                    <div className="history-col msg">Message</div>
+                    <div className="history-col time">Time</div>
+                  </div>
+                  <div className="history-list">
+                    {historyModal.items
+                      .slice((historyPage - 1) * historyPageSize, historyPage * historyPageSize)
+                      .map((h) => (
+                        <div key={h.id} className="history-row">
+                          <span className="history-col state">{h.state}</span>
+                          <span className="history-col msg">{h.message || ''}</span>
+                          <span className="history-col time">
+                            {h.triggered_at ? new Date(h.triggered_at).toLocaleString() : ''}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
+                  {historyModal.items.length > historyPageSize && (
+                    <div className="pagination">
+                      <button
+                        className="btn"
+                        disabled={historyPage <= 1}
+                        onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                      >
+                        Prev
+                      </button>
+                      <span className="logs-count">
+                        Page {historyPage} / {Math.ceil(historyModal.items.length / historyPageSize)}
+                      </span>
+                      <button
+                        className="btn"
+                        disabled={historyPage >= Math.ceil(historyModal.items.length / historyPageSize)}
+                        onClick={() => setHistoryPage((p) => Math.min(Math.ceil(historyModal.items.length / historyPageSize), p + 1))}
+                      >
+                        Next
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 function AlertEditor({ alert, onClose, onSave }) {
+  const [dashboards, setDashboards] = useState([]);
+  const [panels, setPanels] = useState([]);
+  const [selectedDashboard, setSelectedDashboard] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
   const [formData, setFormData] = useState({
     name: alert?.name || '',
     message: alert?.message || '',
@@ -132,19 +217,67 @@ function AlertEditor({ alert, onClose, onSave }) {
     panelId: alert?.panel_id || ''
   });
 
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    const fetchDashboards = async () => {
+      try {
+        const res = await axios.get('http://localhost:4000/api/dashboards', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        setDashboards(res.data.dashboards || []);
+      } catch (err) {
+        console.error('Error fetching dashboards for alerts:', err);
+      }
+    };
+    fetchDashboards();
+  }, []);
+
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    const dashId = formData.dashboardId;
+    if (!dashId) {
+      setPanels([]);
+      setSelectedDashboard(null);
+      return;
+    }
+    const dashObj = dashboards.find((d) => String(d.id) === String(dashId));
+    setSelectedDashboard(dashObj || null);
+    const fetchPanels = async () => {
+      try {
+        const targetId = dashObj?.uid || dashId;
+        const res = await axios.get(`http://localhost:4000/api/dashboards/${targetId}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        setPanels(res.data.panels || res.data?.panels || []);
+      } catch (err) {
+        console.error('Error fetching panels for alert:', err);
+        setPanels([]);
+      }
+    };
+    fetchPanels();
+  }, [formData.dashboardId, dashboards]);
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-
+    const dashId = formData.dashboardId;
+    const panelId = formData.panelId;
+    if (!dashId || !panelId) {
+      alert('Please select dashboard and panel');
+      return;
+    }
     try {
+      setSaving(true);
       const token = localStorage.getItem('token');
       const conditions = {
-        evaluator: { type: formData.condition, params: [formData.threshold] },
+        evaluator: { type: formData.condition, params: [Number(formData.threshold)] },
         operator: { type: 'and' },
         query: { params: ['A', '5m', 'now'] }
       };
 
       const data = {
         ...formData,
+        dashboardId: Number(dashId),
+        panelId: Number(panelId),
         conditions,
         notifications: []
       };
@@ -160,8 +293,12 @@ function AlertEditor({ alert, onClose, onSave }) {
       }
 
       onSave();
+      setErrorMsg('');
     } catch (err) {
       console.error('Error saving alert:', err);
+      setErrorMsg(err.response?.data?.error || 'Failed to save alert');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -184,6 +321,41 @@ function AlertEditor({ alert, onClose, onSave }) {
               placeholder="High CPU Usage"
               required
             />
+          </div>
+
+          <div className="editor-section">
+            <h4>Dashboard</h4>
+            <select
+              className="editor-select"
+              value={formData.dashboardId}
+              onChange={(e) => setFormData({ ...formData, dashboardId: e.target.value, panelId: '' })}
+              required
+            >
+              <option value="">Select dashboard</option>
+              {dashboards.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.title}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="editor-section">
+            <h4>Panel</h4>
+            <select
+              className="editor-select"
+              value={formData.panelId}
+              onChange={(e) => setFormData({ ...formData, panelId: e.target.value })}
+              required
+              disabled={!formData.dashboardId}
+            >
+              <option value="">Select panel</option>
+              {panels.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.title}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="editor-section">
@@ -244,8 +416,11 @@ function AlertEditor({ alert, onClose, onSave }) {
 
           <div className="modal-footer">
             <button type="button" className="btn" onClick={onClose}>Cancel</button>
-            <button type="submit" className="btn-primary">Save Alert</button>
+            <button type="submit" className="btn-primary" disabled={saving}>
+              {saving ? 'Saving...' : 'Save Alert'}
+            </button>
           </div>
+          {errorMsg && <div className="error-banner">{errorMsg}</div>}
         </form>
       </div>
     </div>

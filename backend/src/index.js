@@ -9,11 +9,31 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
+// Simple in-memory log buffer
+const logBuffer = [];
+const MAX_LOGS = 200;
+['log', 'warn', 'error'].forEach((level) => {
+  const original = console[level];
+  console[level] = (...args) => {
+    const entry = {
+      level,
+      message: args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' '),
+      timestamp: new Date().toISOString()
+    };
+    logBuffer.push(entry);
+    if (logBuffer.length > MAX_LOGS) {
+      logBuffer.shift();
+    }
+    original.apply(console, args);
+  };
+});
+
 // Database connection (for app data)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: false
 });
+
 
 // Middleware
 app.use(cors());
@@ -23,6 +43,217 @@ app.use(express.json());
 dataSourceManager.initialize().then(() => {
   console.log('📊 Data sources initialized');
 });
+
+// Ensure required tables/columns exist (lightweight migration for alerts)
+async function runMigrations() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS alerts (
+        id SERIAL PRIMARY KEY,
+        dashboard_id INTEGER REFERENCES dashboards(id) ON DELETE CASCADE,
+        panel_id INTEGER REFERENCES panels(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        message TEXT,
+        state VARCHAR(50) DEFAULT 'ok',
+        frequency VARCHAR(50),
+        handler INTEGER DEFAULT 1,
+        conditions JSONB,
+        notifications JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_triggered TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      ALTER TABLE alerts
+        ADD COLUMN IF NOT EXISTS dashboard_id INTEGER REFERENCES dashboards(id) ON DELETE CASCADE,
+        ADD COLUMN IF NOT EXISTS panel_id INTEGER REFERENCES panels(id) ON DELETE CASCADE,
+        ADD COLUMN IF NOT EXISTS name VARCHAR(255) DEFAULT '' NOT NULL,
+        ADD COLUMN IF NOT EXISTS message TEXT,
+        ADD COLUMN IF NOT EXISTS state VARCHAR(50) DEFAULT 'ok',
+        ADD COLUMN IF NOT EXISTS frequency VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS datasource VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS query TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS conditions JSONB,
+        ADD COLUMN IF NOT EXISTS notifications JSONB,
+        ADD COLUMN IF NOT EXISTS comparator VARCHAR(10) DEFAULT '>',
+        ADD COLUMN IF NOT EXISTS threshold DOUBLE PRECISION DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS time_window VARCHAR(20) DEFAULT '5m',
+        ADD COLUMN IF NOT EXISTS eval_interval_seconds INTEGER DEFAULT 60,
+        ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS last_value DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS last_state VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS last_triggered TIMESTAMP;
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS alert_history (
+        id SERIAL PRIMARY KEY,
+        alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
+        state VARCHAR(50),
+        message TEXT,
+        data JSONB,
+        triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Ensure query column is nullable with default ''
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'alerts' AND column_name = 'query'
+        ) THEN
+          BEGIN
+            EXECUTE 'ALTER TABLE alerts ALTER COLUMN query DROP NOT NULL';
+            EXECUTE 'ALTER TABLE alerts ALTER COLUMN query SET DEFAULT ''''';
+          EXCEPTION WHEN others THEN
+            -- ignore
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'alerts' AND column_name = 'comparator'
+        ) THEN
+          BEGIN
+            EXECUTE 'ALTER TABLE alerts ALTER COLUMN comparator DROP NOT NULL';
+            EXECUTE 'ALTER TABLE alerts ALTER COLUMN comparator SET DEFAULT ''>''';
+          EXCEPTION WHEN others THEN NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+  } catch (err) {
+    console.error('Migration error:', err);
+  }
+}
+
+runMigrations();
+
+// Alert helpers
+const parseFrequencyToMs = (freq = '1m') => {
+  const match = String(freq).match(/(\\d+)(s|m|h)/i);
+  if (!match) return 60000;
+  const val = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  const mult = unit === 's' ? 1000 : unit === 'm' ? 60000 : 3600000;
+  return val * mult;
+};
+
+const extractLatestValue = (result) => {
+  if (!result) return null;
+  if (Array.isArray(result.data)) {
+    const arr = result.data;
+    if (arr.length === 0) return null;
+    const last = arr[arr.length - 1];
+    return last?.value ?? null;
+  }
+  if (Array.isArray(result.series) && result.series.length > 0) {
+    const series = result.series[0]?.data || [];
+    if (series.length === 0) return null;
+    const last = series[series.length - 1];
+    return last?.value ?? null;
+  }
+  return null;
+};
+
+const evaluateCondition = (value, condition) => {
+  if (value === null || value === undefined) return 'no_data';
+  const evaluator = condition?.evaluator || {};
+  const type = evaluator.type || 'above';
+  const params = Array.isArray(evaluator.params) ? evaluator.params : [evaluator.params];
+
+  switch (type) {
+    case 'above':
+      return value > Number(params[0]) ? 'alerting' : 'ok';
+    case 'below':
+      return value < Number(params[0]) ? 'alerting' : 'ok';
+    case 'outside_range': {
+      const [min, max] = params;
+      return value < Number(min) || value > Number(max) ? 'alerting' : 'ok';
+    }
+    case 'within_range': {
+      const [min, max] = params;
+      return value >= Number(min) && value <= Number(max) ? 'alerting' : 'ok';
+    }
+    case 'no_value':
+      return value === null ? 'alerting' : 'ok';
+    default:
+      return 'ok';
+  }
+};
+
+const evaluateAlert = async (alert) => {
+  try {
+    const panelResult = await pool.query('SELECT * FROM panels WHERE id = $1', [alert.panel_id]);
+    if (panelResult.rows.length === 0) return;
+    const panel = panelResult.rows[0];
+
+    let datasource = panel.datasource || 'prometheus';
+    let metric = panel.metric;
+    let query = panel.query;
+
+    try {
+      const targets = typeof panel.targets === 'string' ? JSON.parse(panel.targets) : panel.targets;
+      const target = Array.isArray(targets) ? targets[0] : null;
+      if (target) {
+        datasource = target.datasource || datasource;
+        metric = target.metric || metric;
+        query = target.query || query;
+      }
+    } catch (err) {
+      console.warn('Cannot parse panel targets for alert', err);
+    }
+
+    const result = await dataSourceManager.query({
+      datasource,
+      metric,
+      query,
+      from: 'now-5m',
+      to: 'now'
+    });
+
+    const latest = extractLatestValue(result);
+    const newState = evaluateCondition(latest, alert.conditions);
+    const now = new Date();
+
+    if (newState === 'alerting') {
+      await pool.query(
+        'INSERT INTO alert_history (alert_id, state, message, data, triggered_at) VALUES ($1, $2, $3, $4, $5)',
+        [alert.id, newState, alert.message || '', JSON.stringify({ value: latest }), now]
+      );
+    }
+
+    if (newState !== alert.state) {
+      await pool.query(
+        'UPDATE alerts SET state = $1, last_triggered = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
+        [newState, newState === 'alerting' ? now : alert.last_triggered, alert.id]
+      );
+    }
+  } catch (err) {
+    console.error('Alert evaluate error:', err);
+  }
+};
+
+const evaluateAllAlerts = async () => {
+  try {
+    const alerts = await pool.query('SELECT * FROM alerts');
+    for (const alert of alerts.rows) {
+      await evaluateAlert(alert);
+    }
+  } catch (err) {
+    console.error('Evaluate alerts error:', err);
+  }
+};
 
 // ==================== AUTHENTICATION ====================
 // (Keep existing auth routes - same as before)
@@ -120,6 +351,52 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   }
 });
 
+// Change password
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+
+    const userResult = await pool.query(
+      'SELECT id, password_hash FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const user = userResult.rows[0];
+    const match = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!match) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newHash, user.id]);
+
+    // log to datasource log buffer
+    try {
+      dataSourceManager.pushLog('postgres', `User ${user.id} changed password`);
+    } catch (e) {
+      // ignore logging failure
+    }
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (err) {
+    console.error('Change password error:', err);
+    try {
+      dataSourceManager.pushLog('postgres', `Change password error: ${err.message}`, 'error');
+    } catch (e) {
+      // ignore logging failure
+    }
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -139,15 +416,7 @@ app.get('/api/datasources', authenticateToken, async (req, res) => {
   try {
     const connections = await dataSourceManager.testConnections();
     
-    const datasources = [
-      {
-        id: 'mock',
-        name: 'Mock Data',
-        type: 'mock',
-        status: 'connected',
-        description: 'Generated test data'
-      }
-    ];
+    const datasources = [];
 
     if (connections.prometheus) {
       datasources.push({
@@ -379,6 +648,130 @@ app.delete('/api/panels/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== ALERTS ====================
+
+app.get('/api/alerts', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT a.*, d.title as dashboard_title, p.title as panel_title FROM alerts a JOIN dashboards d ON a.dashboard_id = d.id JOIN panels p ON a.panel_id = p.id ORDER BY a.updated_at DESC'
+    );
+    res.json({ alerts: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch alerts' });
+  }
+});
+
+app.post('/api/alerts', authenticateToken, async (req, res) => {
+  try {
+    const { dashboardId, panelId, name, message, frequency, conditions, notifications } = req.body;
+    const dashId = Number(dashboardId);
+    const pnlId = Number(panelId);
+    if (!dashId || !pnlId) {
+      return res.status(400).json({ error: 'dashboardId and panelId are required' });
+    }
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    // verify dashboard/panel exist and match
+    const panelCheck = await pool.query(
+      'SELECT p.id, p.dashboard_id, p.datasource, p.targets FROM panels p WHERE p.id = $1',
+      [pnlId]
+    );
+    if (panelCheck.rows.length === 0) {
+      return res.status(400).json({ error: 'Panel not found' });
+    }
+    if (panelCheck.rows[0].dashboard_id !== dashId) {
+      return res.status(400).json({ error: 'Panel does not belong to dashboard' });
+    }
+    let alertDatasource = panelCheck.rows[0].datasource || 'prometheus';
+    let alertQuery = '';
+    // try to read from targets if missing
+    if ((!alertDatasource || !alertQuery) && panelCheck.rows[0].targets) {
+      try {
+        const targets = typeof panelCheck.rows[0].targets === 'string'
+          ? JSON.parse(panelCheck.rows[0].targets)
+          : panelCheck.rows[0].targets;
+        if (Array.isArray(targets) && targets[0]?.datasource) {
+          alertDatasource = targets[0].datasource;
+        }
+        if (Array.isArray(targets) && targets[0]?.query) {
+          alertQuery = targets[0].query;
+        }
+      } catch (e) {
+        console.warn('Cannot parse targets for alert datasource');
+      }
+    }
+    if (!alertDatasource) alertDatasource = 'prometheus';
+    if (!alertQuery) {
+      alertQuery = '';
+    }
+
+    const result = await pool.query(
+      'INSERT INTO alerts (dashboard_id, panel_id, name, message, frequency, datasource, query, comparator, threshold, time_window, eval_interval_seconds, is_enabled, conditions, notifications, state) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *',
+      [
+        dashId,
+        pnlId,
+        name,
+        message || '',
+        frequency || '1m',
+        alertDatasource,
+        alertQuery || '',
+        conditions?.evaluator?.type === 'below' ? '<' : conditions?.evaluator?.type === 'above' ? '>' : conditions?.evaluator?.type === 'outside_range' ? 'outside' : 'within',
+        Array.isArray(conditions?.evaluator?.params) ? Number(conditions.evaluator.params[0]) : Number(conditions?.evaluator?.params) || 0,
+        frequency && typeof frequency === 'string' ? frequency : '5m',
+        conditions?.eval_interval_seconds ? Number(conditions.eval_interval_seconds) : 60,
+        true,
+        conditions || {},
+        notifications || [],
+        'pending'
+      ]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Failed to create alert:', err);
+    res.status(500).json({ error: err.message || 'Failed to create alert' });
+  }
+});
+
+app.put('/api/alerts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, message, state, frequency, conditions, notifications } = req.body;
+    
+    const result = await pool.query(
+      'UPDATE alerts SET name = $1, message = $2, state = $3, frequency = $4, conditions = $5, notifications = $6, updated_at = CURRENT_TIMESTAMP WHERE id = $7 RETURNING *',
+      [name, message, state || 'pending', frequency, conditions, notifications, req.params.id]
+    );
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update alert' });
+  }
+});
+
+app.delete('/api/alerts/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM alerts WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Alert deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete alert' });
+  }
+});
+
+// Get alert history
+app.get('/api/alerts/:id/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM alert_history WHERE alert_id = $1 ORDER BY triggered_at DESC LIMIT 100',
+      [req.params.id]
+    );
+    res.json({ history: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch alert history' });
+  }
+});
+
 // ==================== UTILITIES ====================
 
 function generateUID() {
@@ -403,6 +796,34 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// Logs (last 200 console entries)
+app.get('/api/logs', authenticateToken, (req, res) => {
+  res.json({ logs: logBuffer.slice(-MAX_LOGS).reverse() });
+});
+
+// Data source logs
+app.get('/api/datasources/:id/logs', authenticateToken, (req, res) => {
+  try {
+    const logs = dataSourceManager.getLogs(req.params.id);
+    if (!logs || logs.length === 0) {
+      // add a friendly message if empty
+      return res.json({ logs: [{ level: 'info', message: 'No logs yet for this datasource', timestamp: new Date().toISOString() }] });
+    }
+    res.json({ logs: (logs || []).slice().reverse() });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch datasource logs' });
+  }
+});
+
+app.delete('/api/datasources/:id/logs', authenticateToken, (req, res) => {
+  try {
+    dataSourceManager.clearLogs(req.params.id);
+    res.json({ message: 'Logs cleared' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to clear logs' });
+  }
+});
+
 // Error handling
 app.use((err, req, res, next) => {
   console.error(err.stack);
@@ -420,6 +841,9 @@ app.listen(PORT, '0.0.0.0', () => {
   📊 Data Sources: Prometheus, PostgreSQL, Mock
   `);
 });
+
+// Start alert evaluator loop
+setInterval(evaluateAllAlerts, 30000);
 
 // Cleanup on shutdown
 process.on('SIGTERM', async () => {

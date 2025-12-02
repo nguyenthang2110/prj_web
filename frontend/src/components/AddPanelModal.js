@@ -60,7 +60,6 @@ export default function AddPanelModal({ isOpen, onClose, onCreate }) {
             >
               <option value="prometheus">Prometheus</option>
               <option value="postgres">PostgreSQL</option>
-              <option value="mock">Mock (demo)</option>
             </select>
           </div>
 

@@ -71,11 +71,59 @@
     font-size: 14px;
   }
   
-  .navbar-right {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-  }
+.navbar-right {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.account-wrapper {
+  position: relative;
+}
+
+.account-menu {
+  position: absolute;
+  right: 0;
+  top: 42px;
+  background: #1f1f23;
+  border: 1px solid #2c2c2f;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  border-radius: 10px;
+  min-width: 240px;
+  z-index: 30;
+  padding: 10px;
+}
+
+.account-menu-header {
+  padding: 8px;
+  border-bottom: 1px solid #2c2c2f;
+  margin-bottom: 8px;
+}
+
+.account-name {
+  font-weight: 700;
+}
+
+.account-email {
+  color: #9b9b9b;
+  font-size: 12px;
+}
+
+.account-menu-item {
+  width: 100%;
+  text-align: left;
+  background: #2c2c2f;
+  border: 1px solid #3c3c3f;
+  padding: 10px 12px;
+  color: #d8d9da;
+  cursor: pointer;
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.account-menu-item:hover {
+  background: #343842;
+}
   
   .nav-btn {
     background: none;
@@ -315,6 +363,9 @@
   .panel-actions {
     display: flex;
     gap: 8px;
+    margin-left: auto;
+    position: relative;
+    top: -4px;
   }
   
   .panel-btn {
@@ -432,28 +483,45 @@
     overflow: auto;
   }
   
-  .data-table {
-    width: 100%;
-    border-collapse: collapse;
+  .metrics-table-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
   }
   
-  .data-table th,
-  .data-table td {
-    padding: 10px;
-    text-align: left;
-    border-bottom: 1px solid #2c2c2f;
-  }
-  
-  .data-table th {
+  .metrics-table-header {
+    display: flex;
     background: #181b1f;
     color: #9b9b9b;
     font-weight: 600;
     font-size: 12px;
     text-transform: uppercase;
+    padding: 10px;
   }
   
-  .data-table tr:hover {
-    background: #1f1f23;
+  .metrics-table-body {
+    overflow: auto;
+    flex: 1;
+  }
+  
+  .metrics-row {
+    display: flex;
+    border-bottom: 1px solid #2c2c2f;
+    padding: 12px 10px;
+  }
+  
+  .metrics-col {
+    flex: 1;
+    text-align: center;
+  }
+  
+  .metrics-col.time {
+    flex: 0 0 60%;
+  }
+  
+  .metrics-col.value {
+    flex: 0 0 40%;
+    font-weight: 600;
   }
   
   /* Time Range Picker */
@@ -576,20 +644,21 @@
   }
   
   /* Query Editor Modal */
-  .modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.75);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 2000;
-  }
-  
-  .query-editor-modal {
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  overflow: hidden;
+}
+
+.query-editor-modal {
     width: 90%;
     max-width: 900px;
     max-height: 90vh;
@@ -2085,4 +2154,118 @@
 .add-panel-modal .modal-actions button[type="submit"]:active {
   transform: translateY(1px);
   box-shadow: 0 4px 10px rgba(37, 99, 235, 0.4);
+}
+
+/* Logs */
+.logs-page {
+  width: 100%;
+}
+
+.logs-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logs-list {
+  background: #1f1f23;
+  border: 1px solid #2c2c2f;
+  border-radius: 8px;
+  padding: 8px 12px;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.scrollable {
+  overflow-y: auto;
+}
+
+.log-item {
+  display: flex;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #2c2c2f;
+  font-family: monospace;
+  font-size: 13px;
+}
+
+.log-item:last-child {
+  border-bottom: none;
+}
+
+.log-time {
+  color: #9b9b9b;
+  min-width: 190px;
+}
+
+.log-level {
+  color: #3b82f6;
+  min-width: 80px;
+}
+
+.log-msg {
+  color: #d8d9da;
+  word-break: break-all;
+}
+
+.logs-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.logs-count {
+  color: #9b9b9b;
+  font-size: 12px;
+}
+
+/* Alert history modal */
+.history-modal {
+  max-width: 700px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.history-header {
+  display: grid;
+  grid-template-columns: 120px 1fr 200px;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #2c2c2f;
+  font-size: 12px;
+  color: #9b9b9b;
+  text-transform: uppercase;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.history-row {
+  display: grid;
+  grid-template-columns: 120px 1fr 200px;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #2c2c2f;
+}
+
+.history-state {
+  font-weight: 700;
+  color: #f59e0b;
+}
+
+.history-time {
+  color: #9b9b9b;
+  font-size: 12px;
+  text-align: right;
 }

@@ -176,7 +176,6 @@ VALUES (
 -- Insert sample datasources
 INSERT INTO datasources (uid, name, type, url, json_data)
 VALUES 
-    ('ds-mock-001', 'Mock Data', 'mock', 'http://localhost:4000', '{}'),
     ('ds-prom-001', 'Prometheus', 'prometheus', 'http://prometheus:9090', '{}'),
     ('ds-pg-001', 'PostgreSQL', 'postgres', 'postgres://grafana:password123@postgres:5432/grafana_db', '{}')
 ON CONFLICT (uid) DO NOTHING;
